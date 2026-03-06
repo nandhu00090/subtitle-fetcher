@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI tool to fetch the best English subtitle from OpenSubtitles."""
+"""CLI tool to search and fetch English subtitles from OpenSubtitles."""
 
 from __future__ import annotations
 
@@ -97,9 +97,18 @@ def search_english_subtitles(session: requests.Session, movie_name: str) -> list
     return subtitles
 
 
-def choose_best_subtitle(subtitles: list[dict[str, Any]]) -> tuple[int, str]:
-    best_item: dict[str, Any] | None = None
-    best_score: tuple[float, int, int, int] = (-1.0, -1, -1, -1)
+def _subtitle_score(item: dict[str, Any]) -> tuple[float, int, int, int]:
+    attributes = item.get("attributes", {})
+    return (
+        _safe_float(attributes.get("ratings")),
+        _safe_int(attributes.get("download_count")),
+        1 if attributes.get("from_trusted") else 0,
+        1 if not attributes.get("machine_translated") else 0,
+    )
+
+
+def build_subtitle_candidates(subtitles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
 
     for item in subtitles:
         attributes = item.get("attributes", {})
@@ -111,24 +120,77 @@ def choose_best_subtitle(subtitles: list[dict[str, Any]]) -> tuple[int, str]:
         if not isinstance(file_id, int):
             continue
 
-        score = (
-            _safe_float(attributes.get("ratings")),
-            _safe_int(attributes.get("download_count")),
-            1 if attributes.get("from_trusted") else 0,
-            1 if not attributes.get("machine_translated") else 0,
+        release_name = (
+            attributes.get("release")
+            or attributes.get("feature_details", {}).get("title")
+            or "Unknown release"
         )
-        if score > best_score:
-            best_score = score
-            best_item = item
+        candidate = {
+            "file_id": file_id,
+            "release": str(release_name),
+            "rating": _safe_float(attributes.get("ratings")),
+            "downloads": _safe_int(attributes.get("download_count")),
+            "trusted": bool(attributes.get("from_trusted")),
+            "machine_translated": bool(attributes.get("machine_translated")),
+            "score": _subtitle_score(item),
+        }
+        candidates.append(candidate)
 
-    if not best_item:
+    if not candidates:
         raise SubtitleFetcherError("No downloadable subtitle files were found in search results.")
 
-    attributes = best_item.get("attributes", {})
-    files = attributes.get("files") or []
-    file_id = files[0]["file_id"]
-    release_name = attributes.get("release") or attributes.get("feature_details", {}).get("title") or ""
-    return file_id, str(release_name)
+    candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+    return candidates
+
+
+def show_subtitle_results(candidates: list[dict[str, Any]]) -> None:
+    print("\nTop subtitle results:")
+    for index, candidate in enumerate(candidates, start=1):
+        release = candidate["release"]
+        rating = candidate["rating"]
+        downloads = candidate["downloads"]
+        trusted = "yes" if candidate["trusted"] else "no"
+        machine = "yes" if candidate["machine_translated"] else "no"
+        print(
+            f"{index:>2}. {release} "
+            f"(rating: {rating:.1f}, downloads: {downloads}, trusted: {trusted}, machine_translated: {machine})"
+        )
+    print("")
+
+
+def choose_subtitle(
+    candidates: list[dict[str, Any]],
+    auto_select: bool,
+) -> dict[str, Any]:
+    if auto_select or len(candidates) == 1:
+        return candidates[0]
+
+    if not sys.stdin.isatty():
+        print("Non-interactive input detected. Automatically choosing the top result.")
+        return candidates[0]
+
+    prompt = (
+        f"Select subtitle [1-{len(candidates)}], Enter for 1, or q to quit: "
+    )
+    while True:
+        try:
+            selection = input(prompt).strip().lower()
+        except EOFError as exc:
+            raise SubtitleFetcherError("No selection provided in non-interactive input.") from exc
+
+        if selection in {"", "1"}:
+            return candidates[0]
+        if selection in {"q", "quit", "exit"}:
+            raise SubtitleFetcherError("Selection cancelled by user.")
+        if not selection.isdigit():
+            print("Invalid selection. Enter a number or q to quit.")
+            continue
+
+        index = int(selection)
+        if 1 <= index <= len(candidates):
+            return candidates[index - 1]
+
+        print(f"Selection out of range. Choose 1-{len(candidates)}.")
 
 
 def request_download_link(session: requests.Session, file_id: int) -> tuple[str, str]:
@@ -205,13 +267,19 @@ def save_subtitle_file(movie_name: str, subtitle_content: bytes) -> str:
     return output_path
 
 
-def fetch_and_save_subtitle(movie_name: str) -> str:
+def fetch_and_save_subtitle(movie_name: str, auto_select: bool, max_results: int) -> str:
     session = build_session()
     subtitles = search_english_subtitles(session, movie_name)
-    file_id, release_name = choose_best_subtitle(subtitles)
-    if release_name:
-        print(f"Selected subtitle release: {release_name}")
+    candidates = build_subtitle_candidates(subtitles)
+    top_candidates = candidates[:max_results]
+    show_subtitle_results(top_candidates)
+    selected = choose_subtitle(top_candidates, auto_select=auto_select)
+    file_id = selected["file_id"]
+    release_name = selected["release"]
+
+    print(f"Selected subtitle release: {release_name}")
     download_link, _filename = request_download_link(session, file_id)
+    print("Downloading subtitle file...")
     downloaded_content = download_subtitle_bytes(download_link)
     subtitle_content = extract_srt_if_zip(downloaded_content)
     return save_subtitle_file(movie_name, subtitle_content)
@@ -219,16 +287,33 @@ def fetch_and_save_subtitle(movie_name: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch the best English subtitle from OpenSubtitles."
+        description="Search OpenSubtitles, choose a subtitle, and save it as .srt."
     )
     parser.add_argument("movie_name", help='Movie title to search, e.g. "Inception"')
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Automatically choose the top result without prompting.",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=5,
+        help="Number of top results to show (default: 5).",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        output_path = fetch_and_save_subtitle(args.movie_name)
+        if args.max_results < 1:
+            raise SubtitleFetcherError("--max-results must be at least 1.")
+        output_path = fetch_and_save_subtitle(
+            args.movie_name,
+            auto_select=args.auto,
+            max_results=args.max_results,
+        )
     except SubtitleFetcherError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
